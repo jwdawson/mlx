@@ -857,54 +857,97 @@ void sdpa_vector_2pass(
   hash_name += has_sinks ? "_sinks_" : "_nosinks_";
   hash_name += std::to_string(blocks);
 
-  // Get the kernel
-  auto kernel = d.get_kernel(kname, hash_name, func_consts);
-  // M1/M2 do not have enough threads per threadgroup for default TK=4 kernel
-  bool has_tk1_variant =
-      (q.dtype() == bfloat16 && q.shape(-1) == 256 && v.shape(-1) == 256) ||
-      (q.dtype() == float32 && q.shape(-1) == v.shape(-1) &&
-       (q.shape(-1) == 192 || q.shape(-1) == 256));
-  if (has_tk1_variant &&
-      group_dims.width * group_dims.height * group_dims.depth >
-          kernel->maxTotalThreadsPerThreadgroup()) {
-    kname += "_tk1";
-    hash_name += "_tk1";
-    kernel = d.get_kernel(kname, hash_name, func_consts);
-  }
-  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  // 2 to 8 queries (a speculative verify pass) without a mask array or sinks:
+  // one threadgroup takes all of a KV head's rows and reads each key and value
+  // once for them (sdpa_vector_2pass_1_mma), instead of once per row.
+  int n_rows = gqa_factor * q.shape(2);
+  int D = q.shape(-1);
+  bool use_mma = env::get_var("MLX_SDPA_VECTOR_MMA", 1) == 1 && !has_mask &&
+      !has_sinks && !query_transposed && q.shape(2) >= 2 && n_rows <= 32 &&
+      (q.dtype() == float16 || q.dtype() == bfloat16) && D == v.shape(-1) &&
+      (D == 64 || D == 128 || D == 256) &&
+      q.shape(1) == gqa_factor * k.shape(1);
+  if (use_mma) {
+    // 1, 2 or 4 simdgroups of 8 rows: the tile loaders need the thread count to
+    // divide the tiles.
+    int wm = n_rows <= 8 ? 1 : (n_rows <= 16 ? 2 : 4);
+    std::string mma_name = "sdpa_vector_2pass_1_mma_";
+    mma_name += get_type_string(q.dtype());
+    mma_name += "_" + std::to_string(D) + "_" + std::to_string(D);
+    mma_name += "_wm" + std::to_string(wm);
+    std::string mma_hash = mma_name;
+    mma_hash += do_causal ? "_c_" : "_nc_";
+    mma_hash += std::to_string(blocks);
+    auto mma_kernel = d.get_kernel(mma_name, mma_hash, func_consts);
+    MTL::Size mma_group_dims(32 * wm, 1, 1);
+    check_kernel_threadgroup_size(mma_kernel, mma_group_dims, mma_hash);
+    compute_encoder.set_compute_pipeline_state(mma_kernel);
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v, 2);
+    compute_encoder.set_output_array(intermediate, 3);
+    compute_encoder.set_output_array(sums, 4);
+    compute_encoder.set_output_array(maxs, 5);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(k_head_stride, 8);
+    compute_encoder.set_bytes(k_seq_stride, 9);
+    compute_encoder.set_bytes(v_head_stride, 10);
+    compute_encoder.set_bytes(v_seq_stride, 11);
+    compute_encoder.set_bytes(scale, 12);
+    compute_encoder.set_bytes(n_rows, 19);
+    int q_seq_len = q.shape(2);
+    compute_encoder.set_bytes(q_seq_len, 20);
+    compute_encoder.dispatch_threadgroups(grid_dims, mma_group_dims);
+  } else {
+    // Get the kernel
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    // M1/M2 do not have enough threads per threadgroup for default TK=4 kernel
+    bool has_tk1_variant =
+        (q.dtype() == bfloat16 && q.shape(-1) == 256 && v.shape(-1) == 256) ||
+        (q.dtype() == float32 && q.shape(-1) == v.shape(-1) &&
+         (q.shape(-1) == 192 || q.shape(-1) == 256));
+    if (has_tk1_variant &&
+        group_dims.width * group_dims.height * group_dims.depth >
+            kernel->maxTotalThreadsPerThreadgroup()) {
+      kname += "_tk1";
+      hash_name += "_tk1";
+      kernel = d.get_kernel(kname, hash_name, func_consts);
+    }
+    check_kernel_threadgroup_size(kernel, group_dims, hash_name);
 
-  compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
 
-  // Set its arguments
-  compute_encoder.set_input_array(q, 0);
-  compute_encoder.set_input_array(k, 1);
-  compute_encoder.set_input_array(v, 2);
-  compute_encoder.set_output_array(intermediate, 3);
-  compute_encoder.set_output_array(sums, 4);
-  compute_encoder.set_output_array(maxs, 5);
-  compute_encoder.set_bytes(N, 7);
-  compute_encoder.set_bytes(k_head_stride, 8);
-  compute_encoder.set_bytes(k_seq_stride, 9);
-  compute_encoder.set_bytes(v_head_stride, 10);
-  compute_encoder.set_bytes(v_seq_stride, 11);
-  compute_encoder.set_bytes(scale, 12);
-  if (has_mask) {
-    auto& m = *mask;
-    compute_encoder.set_input_array(m, 13 + float_mask);
-    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
-    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
-    int32_t head_stride =
-        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-    compute_encoder.set_bytes(kv_seq_stride, 15);
-    compute_encoder.set_bytes(q_seq_stride, 16);
-    compute_encoder.set_bytes(head_stride, 17);
-  }
-  if (has_sinks) {
-    compute_encoder.set_input_array(*sinks, 18);
-  }
+    // Set its arguments
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v, 2);
+    compute_encoder.set_output_array(intermediate, 3);
+    compute_encoder.set_output_array(sums, 4);
+    compute_encoder.set_output_array(maxs, 5);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(k_head_stride, 8);
+    compute_encoder.set_bytes(k_seq_stride, 9);
+    compute_encoder.set_bytes(v_head_stride, 10);
+    compute_encoder.set_bytes(v_seq_stride, 11);
+    compute_encoder.set_bytes(scale, 12);
+    if (has_mask) {
+      auto& m = *mask;
+      compute_encoder.set_input_array(m, 13 + float_mask);
+      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t head_stride =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      compute_encoder.set_bytes(kv_seq_stride, 15);
+      compute_encoder.set_bytes(q_seq_stride, 16);
+      compute_encoder.set_bytes(head_stride, 17);
+    }
+    if (has_sinks) {
+      compute_encoder.set_input_array(*sinks, 18);
+    }
 
-  // Launch
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    // Launch
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
 
   // Final pass
   kname.clear();
@@ -914,7 +957,7 @@ void sdpa_vector_2pass(
   kname += std::to_string(v.shape(-1));
 
   // Get the kernel
-  kernel = d.get_kernel(kname);
+  auto kernel = d.get_kernel(kname);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
